@@ -1,0 +1,5 @@
+click>=8.1,<8.2
+typer[all]>=0.9,<0.11
+pypdf>=4.3,<5.0
+# Optional fallback for Python <3.11
+Tomli>=2.0.1; python_version < "3.11"
