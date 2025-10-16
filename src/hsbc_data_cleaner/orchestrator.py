@@ -14,10 +14,13 @@ from . import __version__
 from .chunking.chunker import chunk_section_text, generate_change_summary
 from .cleaning.deduplicate import SectionHashResult, compute_hash, evaluate_sections
 from .config import AppConfig
-from .outputs.writer_structured import append_top_holdings_companies
+from .outputs.writer_structured import (
+    append_top_holdings_companies,
+    append_top_holdings_fixed_income,
+)
 from .parsers.pdf_parser import (
     PdfSection,
-    extract_top_holdings_companies,
+    extract_top_holdings_entries,
     parse_pdf_sections,
 )
 from .preprocessing.english_filter import remove_english_pages
@@ -69,7 +72,8 @@ def run_cleaning(
     if not resolved_input.exists():
         LOGGER.warning("Input directory %s does not exist; nothing to process.", resolved_input)
     else:
-        all_companies: List[str] = []
+        equity_companies: List[str] = []
+        fixed_income_holdings: List[str] = []
         for input_pdf in sorted(resolved_input.glob("*.pdf")):
             output_pdf = clean_pdf_dir / input_pdf.name
             filter_result = remove_english_pages(input_pdf, output_pdf)
@@ -117,17 +121,34 @@ def run_cleaning(
 
             for section in sections.sections:
                 if section.name == "top_holdings":
-                    companies = extract_top_holdings_companies(section)
-                    all_companies.extend(companies)
+                    entries = extract_top_holdings_entries(section)
+                    for entry in entries:
+                        if entry.instrument_type == "fixed_income":
+                            fixed_income_holdings.append(entry.name)
+                        else:
+                            equity_companies.append(entry.name)
 
-        if all_companies:
+        if equity_companies:
             append_top_holdings_companies(
-                companies=all_companies,
+                companies=equity_companies,
                 quarter=quarter,
                 base_dir=settings.structured_dir,
             )
             LOGGER.info(
-                "Recorded %s unique top-holding companies for %s", len(set(all_companies)), quarter
+                "Recorded %s unique equity top-holding companies for %s",
+                len(set(equity_companies)),
+                quarter,
+            )
+        if fixed_income_holdings:
+            append_top_holdings_fixed_income(
+                holdings=fixed_income_holdings,
+                quarter=quarter,
+                base_dir=settings.structured_dir,
+            )
+            LOGGER.info(
+                "Recorded %s unique fixed-income holdings for %s",
+                len(set(fixed_income_holdings)),
+                quarter,
             )
 
     LOGGER.warning("Remaining pipeline modules not yet implemented beyond English-page filtering.")
@@ -152,8 +173,8 @@ def _emit_chunks(
     overlap: int = 80,
 ) -> None:
     chunks_dir.mkdir(parents=True, exist_ok=True)
-    timestamp = datetime.now().strftime("%Y%m%dT%H%M%S")
-    filename = f"{fund_metadata.code}_{quarter}_{timestamp}.json"
+    timestamp = datetime.now().strftime("%Y%m%dT%H%M%S%f")
+    filename = f"{fund_metadata.name}_{fund_metadata.code}_{quarter}_{timestamp}.json"
     output_path = chunks_dir / filename
 
     status_map = {result.key: result for result in dedupe_results}

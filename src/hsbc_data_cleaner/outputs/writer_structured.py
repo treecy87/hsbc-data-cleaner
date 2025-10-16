@@ -17,19 +17,35 @@ def append_top_holdings_companies(
     base_dir = Path(base_dir)
     base_dir.mkdir(parents=True, exist_ok=True)
     csv_path = base_dir / "top_holdings_companies.csv"
+    _append_unique_strings(csv_path, "company_name", companies)
 
+
+def append_top_holdings_fixed_income(
+    holdings: Iterable[str],
+    quarter: str,
+    base_dir: Path,
+) -> None:
+    """Maintain a global unique list of fixed-income holdings."""
+
+    base_dir = Path(base_dir)
+    base_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = base_dir / "top_holdings_bonds.csv"
+    _append_unique_strings(csv_path, "security_name", holdings)
+
+
+def _append_unique_strings(csv_path: Path, header: str, values: Iterable[str]) -> None:
     existing: Dict[str, str] = {}
     if csv_path.exists():
         with csv_path.open("r", newline="", encoding="utf-8") as handle:
             reader = csv.DictReader(handle)
             for row in reader:
-                name = (row.get("company_name") or "").strip()
-                if name:
-                    existing[name.lower()] = name
+                value = (row.get(header) or "").strip()
+                if value:
+                    existing[value.lower()] = value
 
     updated = False
-    for company in companies:
-        normalized = company.strip()
+    for value in values:
+        normalized = value.strip()
         if not normalized:
             continue
         key = normalized.lower()
@@ -44,6 +60,6 @@ def append_top_holdings_companies(
     sorted_names = sorted(existing.values(), key=lambda x: x.lower())
     with csv_path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.writer(handle)
-        writer.writerow(["company_name"])
-        for name in sorted_names:
-            writer.writerow([name])
+        writer.writerow([header])
+        for item in sorted_names:
+            writer.writerow([item])

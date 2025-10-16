@@ -144,10 +144,11 @@
 - 这些状态文件支持幂等处理、增量对比、与 n8n 日志对齐。
 
 ### 6.4 持仓公司名录（新增）
-- **目标**：在清洗每份基金 PDF 时提取“Top 10 Holdings”板块中的公司名称，维护一份去重后的公司列表，为后续构建持仓公司数据库做准备。
-- **存储位置**：`outputs/structured/top_holdings_companies.csv`
-  - 仅包含一列 `company_name`；清洗程序会统一去掉首尾空白、小写比较后追加，并保持集合有序写回。
-- **处理流程**：章节解析后识别 `top_holdings` 段落，解析公司名称，剔除表头和统计行，调用写入模块刷新 CSV；同时保留季度结构化数据以备溯源。
+- **目标**：在清洗每份基金 PDF 时提取“Top 10 Holdings”板块中的持仓信息，按照资产类型维护独立的去重清单，为后续构建持仓数据库做准备。
+- **存储位置**：
+  - 股票持仓：`outputs/structured/top_holdings_companies.csv`，仅包含一列 `company_name`；清洗程序统一去掉首尾空白、按小写去重并保持字母序写回。
+  - 固定收益持仓：`outputs/structured/top_holdings_bonds.csv`，仅包含一列 `security_name`；记录债券、公募票据等条目，去重规则同上。
+- **处理流程**：章节解析后识别 `top_holdings` 段落，使用 `extract_top_holdings_entries` 按标题和名称自动判断“equity” 与 “fixed_income”，剔除表头和统计行；随后分别调用结构化写入模块刷新对应 CSV，并保留季度结构化产出以备溯源。
 - Section 指纹在 `chunk_index` 文件中以 `{section_name}:{序号}` 的形式标识，方便同名章节多次出现时分别追踪。
 
 ## 7. Pinecone 与向量策略
@@ -221,12 +222,13 @@ hsbc_data_cleaner/
 3. **执行清洗**
    - 命令示例：
      ```bash
-     python -m hsbc_data_cleaner.cli \
+     PYTHONPATH=src python -m hsbc_data_cleaner.cli \
        --quarter 2025Q2 \
        --fund-code U62717 \
        --input-dir /data/hsbc/raw/2025-Q2 \
        --incremental true
      ```
+     > 若已通过 `pip install .` 安装至虚拟环境，可省略 `PYTHONPATH=src` 前缀，直接执行 `python -m hsbc_data_cleaner.cli ...`。
    - 关键参数：
      - `--quarter`：目标季度，必填；
      - `--fund-code`：可选，缺省时批量处理季度内全部基金；

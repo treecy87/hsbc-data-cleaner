@@ -36,6 +36,12 @@ DEFAULT_SECTION_DEFINITIONS: Sequence[SectionDefinition] = [
         patterns=[
             re.compile(r"top\s+10\s+holdings", re.IGNORECASE),
             re.compile(r"十大持股"),
+            re.compile(r"十大持倉"),
+            re.compile(r"十大持仓"),
+            re.compile(r"股票十大持倉"),
+            re.compile(r"固定收益十大持倉"),
+            re.compile(r"十+大+.*持+股+"),
+            re.compile(r"十+大+.*持+倉+"),
             re.compile(r"十大投資項目"),
         ],
     ),
@@ -100,9 +106,8 @@ _SECTOR_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
-_CHINESE_HOLDING_PATTERN = re.compile(
-    r"^(?P<name>[A-Za-z0-9.,'&()/\- ]+?)\s+\S+\s+\S+\s+[0-9]+(?:\.[0-9]+)?$"
-)
+_VALUE_AT_END_PATTERN = re.compile(r"([0-9]+(?:\.[0-9]+)?)%?$")
+_CHINESE_CHAR_PATTERN = re.compile(r"[\u4e00-\u9fff]")
 
 
 @dataclass
@@ -139,6 +144,14 @@ class ParseResult:
                 for section in self.sections
             ],
         }
+
+
+@dataclass(frozen=True)
+class TopHoldingEntry:
+    """Individual holding extracted from a top-holdings section."""
+
+    name: str
+    instrument_type: str  # "equity" or "fixed_income"
 
 
 def parse_pdf_sections(
@@ -194,30 +207,157 @@ def parse_pdf_sections(
     )
 
 
-def extract_top_holdings_companies(section: PdfSection) -> List[str]:
-    """Extract company names from a top holdings section."""
+def extract_top_holdings_entries(section: PdfSection) -> List[TopHoldingEntry]:
+    """Extract top holdings entries with instrument classification."""
 
-    companies: List[str] = []
+    entries: List[TopHoldingEntry] = []
+    stop_keywords = (
+        "投資組合",
+        "組合分布",
+        "組合分佈",
+        "類別分布",
+        "類別分佈",
+        "股票特點",
+        "固定收益特點",
+        "行業分佈",
+        "行業分布",
+        "滙豐集合",
+        "月度報告",
+        "有關詞彙",
+        "重要資訊",
+        "關注我們",
+    )
+    buffer: List[str] = []
+    current_type: Optional[str] = _infer_type_from_title(section.title)
+
+    def _flush_buffer() -> None:
+        if not buffer:
+            return
+        candidate = " ".join(buffer).strip()
+        candidate = re.sub(r"\s+", " ", candidate)
+        match = _VALUE_AT_END_PATTERN.search(candidate)
+        if not match or match.end() != len(candidate):
+            return
+        name_part = candidate[: match.start()].strip()
+        if not name_part or "%" in name_part:
+            return
+
+        # If the line matches the sector-based pattern, reuse that parsing.
+        sector_match = _SECTOR_PATTERN.match(name_part)
+        if sector_match:
+            name = sector_match.group("name").strip()
+        else:
+            name = _clean_company_name(name_part)
+
+        if name:
+            inferred_type = current_type or _infer_type_from_name(name)
+            entries.append(
+                TopHoldingEntry(
+                    name=name,
+                    instrument_type=inferred_type or "equity",
+                )
+            )
+
     for line in section.lines:
-        if not line or line.lower().startswith("sector "):
+        text = line.strip()
+        if not text:
             continue
-        if line.lower().startswith("total") or "合共" in line:
+        lowered = text.lower()
+        if lowered.startswith("sector "):
             continue
+        if lowered.startswith("total") or "合共" in text:
+            continue
+        title_type = _infer_type_from_title(text)
+        if title_type:
+            _flush_buffer()
+            buffer = []
+            current_type = title_type
+            continue
+        if any(keyword in text for keyword in ("查閱", "請掃描")):
+            _flush_buffer()
+            buffer = []
+            continue
+        if any(keyword in text for keyword in stop_keywords):
+            _flush_buffer()
+            buffer = []
+            break
 
-        match = _SECTOR_PATTERN.match(line)
-        if match:
-            name = match.group("name").strip()
-            if name:
-                companies.append(name)
-                continue
+        buffer.append(text)
+        candidate = " ".join(buffer)
+        candidate = re.sub(r"\s+", " ", candidate)
+        match = _VALUE_AT_END_PATTERN.search(candidate)
+        if match and match.end() == len(candidate):
+            _flush_buffer()
+            buffer = []
 
-        match_cn = _CHINESE_HOLDING_PATTERN.match(line)
-        if match_cn:
-            name = match_cn.group("name").strip()
-            if name:
-                companies.append(name)
+    _flush_buffer()
+    return entries
 
-    return companies
+
+def extract_top_holdings_companies(section: PdfSection) -> List[str]:
+    """Legacy helper returning only equity holdings."""
+
+    return [
+        entry.name
+        for entry in extract_top_holdings_entries(section)
+        if entry.instrument_type != "fixed_income"
+    ]
+
+
+def _infer_type_from_title(title: Optional[str]) -> Optional[str]:
+    if not title:
+        return None
+    normalized = title.lower()
+    header_tokens = ("持倉", "持仓", "holdings", "holding")
+    if not any(token in normalized for token in header_tokens):
+        return None
+    if any(keyword in normalized for keyword in ("固定收益", "fixed income", "債券", "债券", "bond")):
+        return "fixed_income"
+    if any(keyword in normalized for keyword in ("股票", "equity")):
+        return "equity"
+    return None
+
+
+def _infer_type_from_name(name: str) -> Optional[str]:
+    normalized = name.lower()
+    bond_tokens = (
+        " bond",
+        "bond ",
+        "bnd ",
+        " note",
+        "notes",
+        "債",
+        "债",
+        "debenture",
+        "bill",
+        "treasury",
+        "certificate",
+    )
+    if any(token in normalized for token in bond_tokens):
+        return "fixed_income"
+    return None
+
+
+def _contains_cjk(text: str) -> bool:
+    return bool(_CHINESE_CHAR_PATTERN.search(text))
+
+
+def _clean_company_name(raw: str) -> str:
+    """Trim trailing region/sector metadata from a holdings string."""
+
+    normalized = re.sub(r"\s+", " ", raw).strip()
+    if not normalized:
+        return ""
+
+    tokens = normalized.split()
+    primary: List[str] = []
+    for token in tokens:
+        if _contains_cjk(token) and primary:
+            break
+        primary.append(token)
+
+    cleaned = " ".join(primary).strip()
+    return cleaned or normalized
 
 
 def _prepare_lines(lines: Iterable[str]) -> List[str]:
