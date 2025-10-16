@@ -2,20 +2,33 @@
 
 from __future__ import annotations
 
-import logging
 import json
+import logging
+import re
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional, Sequence
 
-from .config import AppConfig
-from .preprocessing.english_filter import remove_english_pages
-from .parsers.pdf_parser import extract_top_holdings_companies, parse_pdf_sections
-from .outputs.writer_structured import append_top_holdings_companies
-from .cleaning.deduplicate import SectionHashResult, evaluate_sections
-from datetime import datetime
+from . import __version__
 from .chunking.chunker import chunk_section_text, generate_change_summary
+from .cleaning.deduplicate import SectionHashResult, compute_hash, evaluate_sections
+from .config import AppConfig
+from .outputs.writer_structured import append_top_holdings_companies
+from .parsers.pdf_parser import (
+    PdfSection,
+    extract_top_holdings_companies,
+    parse_pdf_sections,
+)
+from .preprocessing.english_filter import remove_english_pages
 
 LOGGER = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class FundMetadata:
+    code: str
+    name: str
 
 
 def run_cleaning(
@@ -77,10 +90,10 @@ def run_cleaning(
                 [section.name for section in sections.sections],
             )
 
-            fund_id = fund_code or input_pdf.stem
+            fund_meta = _derive_fund_metadata(input_pdf, fund_code)
             chunk_index_path = settings.state_dir / "chunk_index.json"
             dedupe_results = evaluate_sections(
-                fund_id=fund_id,
+                fund_id=fund_meta.code,
                 quarter=quarter,
                 sections=sections.sections,
                 index_path=chunk_index_path,
@@ -89,14 +102,17 @@ def run_cleaning(
             status_counts = {"new": 0, "updated": 0, "reuse": 0}
             for item in dedupe_results:
                 status_counts[item.status] = status_counts.get(item.status, 0) + 1
-            LOGGER.info("Section dedupe for %s: %s", fund_id, status_counts)
+            LOGGER.info("Section dedupe for %s: %s", fund_meta.code, status_counts)
 
             _emit_chunks(
                 sections=sections.sections,
                 dedupe_results=dedupe_results,
                 quarter=quarter,
                 chunks_dir=settings.resolve_clean_chunks_dir(quarter, chunks_dir),
-                fund_id=fund_id,
+                fund_metadata=fund_meta,
+                file_timestamp=_format_file_timestamp(input_pdf),
+                data_date=None,
+                language=_infer_language(sections.sections),
             )
 
             for section in sections.sections:
@@ -124,17 +140,20 @@ def run_cleaning(
 
 def _emit_chunks(
     *,
-    sections: List,
+    sections: Sequence[PdfSection],
     dedupe_results: List[SectionHashResult],
     quarter: str,
     chunks_dir: Path,
-    fund_id: str,
+    fund_metadata: FundMetadata,
+    file_timestamp: str,
+    data_date: Optional[str],
+    language: str,
     chunk_size: int = 600,
     overlap: int = 80,
 ) -> None:
     chunks_dir.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%dT%H%M%S")
-    filename = f"{fund_id}_{quarter}_{timestamp}.json"
+    filename = f"{fund_metadata.code}_{quarter}_{timestamp}.json"
     output_path = chunks_dir / filename
 
     status_map = {result.key: result for result in dedupe_results}
@@ -153,6 +172,19 @@ def _emit_chunks(
                 current_hash=result.current_hash,
             )
 
+        page_range = _format_page_range(section.pages)
+        summary_entry_base = _base_metadata_entry(
+            fund_metadata=fund_metadata,
+            quarter=quarter,
+            file_timestamp=file_timestamp,
+            data_date=data_date,
+            language=language,
+            section_name=section.name,
+            page_range=page_range,
+            previous_hash=result.previous_hash if result else None,
+            section_hash=result.current_hash if result else None,
+        )
+
         chunks = chunk_section_text(
             section.name,
             section.text,
@@ -161,25 +193,35 @@ def _emit_chunks(
         )
 
         if summary:
+            summary_entry = {
+                **summary_entry_base,
+                "type": "summary",
+                "text": summary,
+                "change_type": result.status if result else "unknown",
+                "chunk_index": None,
+                "chunk_hash": compute_hash(summary),
+                "start_offset": None,
+                "end_offset": None,
+                "structured_refs": [],
+            }
             entries.append(
-                {
-                    "type": "summary",
-                    "section": section.name,
-                    "summary": summary,
-                    "status": result.status if result else "unknown",
-                }
+                summary_entry
             )
 
         for chunk in chunks:
+            chunk_entry = {
+                **summary_entry_base,
+                "type": "chunk",
+                "chunk_index": chunk.index,
+                "chunk_hash": compute_hash(chunk.text),
+                "change_type": result.status if result else "unknown",
+                "text": chunk.text,
+                "start_offset": chunk.start_offset,
+                "end_offset": chunk.end_offset,
+                "structured_refs": [],
+            }
             entries.append(
-                {
-                    "type": "chunk",
-                    "section": chunk.section,
-                    "index": chunk.index,
-                    "text": chunk.text,
-                    "start_offset": chunk.start_offset,
-                    "end_offset": chunk.end_offset,
-                }
+                chunk_entry
             )
 
     with output_path.open("w", encoding="utf-8") as handle:
@@ -214,3 +256,79 @@ def upload_chunks(
         resolved_chunks,
         target_folder,
     )
+
+
+def _derive_fund_metadata(pdf_path: Path, override_code: Optional[str]) -> FundMetadata:
+    stem = pdf_path.stem
+    name_candidate, code_candidate = _split_name_code(stem)
+    code = (override_code or code_candidate or stem).strip()
+    name = name_candidate.strip() or stem
+    return FundMetadata(code=code, name=name)
+
+
+def _split_name_code(stem: str) -> tuple[str, str]:
+    parts = stem.rsplit("_", 1)
+    if len(parts) == 2 and re.fullmatch(r"[A-Za-z0-9\-]+", parts[1]):
+        return parts[0], parts[1]
+    return stem, stem
+
+
+def _format_file_timestamp(pdf_path: Path) -> str:
+    try:
+        mtime = pdf_path.stat().st_mtime
+    except OSError:
+        return datetime.now(timezone.utc).isoformat()
+    return datetime.fromtimestamp(mtime, timezone.utc).isoformat()
+
+
+def _format_page_range(pages: Sequence[int]) -> Optional[str]:
+    if not pages:
+        return None
+    start = min(pages)
+    end = max(pages)
+    if start == end:
+        return str(start)
+    return f"{start}-{end}"
+
+
+def _base_metadata_entry(
+    *,
+    fund_metadata: FundMetadata,
+    quarter: str,
+    file_timestamp: str,
+    data_date: Optional[str],
+    language: str,
+    section_name: str,
+    page_range: Optional[str],
+    previous_hash: Optional[str],
+    section_hash: Optional[str],
+) -> Dict[str, Optional[str]]:
+    return {
+        "fund_code": fund_metadata.code,
+        "fund_name": fund_metadata.name,
+        "section": section_name,
+        "page_range": page_range,
+        "quarter": quarter,
+        "data_date": data_date,
+        "file_timestamp": file_timestamp,
+        "language": language,
+        "source_type": "pdf",
+        "version": __version__,
+        "previous_chunk_hash": previous_hash,
+        "section_hash": section_hash,
+    }
+
+
+def _infer_language(sections: Sequence[PdfSection]) -> str:
+    total_chars = 0
+    ascii_chars = 0
+    for section in sections:
+        text = section.text
+        total_chars += len(text)
+        ascii_chars += sum(1 for ch in text if ch.isascii())
+    if not total_chars:
+        return "unknown"
+    ratio = ascii_chars / total_chars
+    if ratio > 0.3:
+        return "mix"
+    return "zh"
